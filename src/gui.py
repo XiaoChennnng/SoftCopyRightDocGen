@@ -19,6 +19,7 @@ from .ai_service import AIService
 
 
 class AIConfigStore:
+    """AI 配置持久化存储类，使用 SQLite 和 Windows DPAPI 加密"""
     def __init__(self, app_name: str = "SoftCopyRightDocGen"):
         self.app_name = app_name
 
@@ -30,6 +31,7 @@ class AIConfigStore:
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._CryptProtectData = self._crypt32.CryptProtectData
         self._CryptUnprotectData = self._crypt32.CryptUnprotectData
+        # 配置 DPAPI 函数参数类型
         self._CryptProtectData.argtypes = [
             ctypes.POINTER(self._DATA_BLOB),
             wintypes.LPCWSTR,
@@ -52,18 +54,23 @@ class AIConfigStore:
         self._CryptUnprotectData.restype = wintypes.BOOL
 
     def _base_dir(self) -> str:
+        """获取项目根目录"""
         return str(pathlib.Path(__file__).resolve().parent.parent)
 
     def _db_dir(self) -> str:
+        """获取数据存储目录"""
         return os.path.join(self._base_dir(), "data")
 
     def _db_path(self) -> str:
+        """获取数据库文件路径"""
         return os.path.join(self._db_dir(), "settings.db")
 
     def _entropy_path(self) -> str:
+        """获取加密盐值 (entropy) 文件路径"""
         return os.path.join(self._db_dir(), "entropy.bin")
 
     def _connect(self) -> sqlite3.Connection:
+        """建立数据库连接并初始化表结构"""
         os.makedirs(self._db_dir(), exist_ok=True)
         conn = sqlite3.connect(self._db_path())
         conn.execute("PRAGMA journal_mode=WAL")
@@ -74,10 +81,12 @@ class AIConfigStore:
         return conn
 
     def _legacy_db_path(self) -> str:
+        """获取旧版数据库路径（用于迁移）"""
         base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, self.app_name, "settings.db")
 
     def _get_entropy(self) -> bytes:
+        """获取或生成加密盐值"""
         os.makedirs(self._db_dir(), exist_ok=True)
         path = self._entropy_path()
         try:
@@ -104,6 +113,7 @@ class AIConfigStore:
         return data
 
     def _dpapi_encrypt(self, data: bytes, entropy: bytes) -> bytes | None:
+        """使用 Windows DPAPI 加密数据"""
         if not data:
             return b""
         ent_buf = ctypes.create_string_buffer(entropy)
@@ -120,6 +130,7 @@ class AIConfigStore:
             self._kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
 
     def _dpapi_decrypt(self, data: bytes, entropy: bytes) -> bytes | None:
+        """使用 Windows DPAPI 解密数据"""
         if data is None:
             return None
         if data == b"":
@@ -138,6 +149,7 @@ class AIConfigStore:
             self._kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
 
     def _load_ai_config_from_db(self, db_path: str) -> dict | None:
+        """从指定数据库加载 AI 配置"""
         try:
             if not os.path.isfile(db_path):
                 return None
@@ -158,6 +170,7 @@ class AIConfigStore:
             return None
 
     def migrate_legacy_if_needed(self) -> None:
+        """如果存在旧版配置，则进行迁移"""
         try:
             existing = self.load_ai_config()
             if existing:
@@ -169,6 +182,7 @@ class AIConfigStore:
             return
 
     def load_ai_config(self) -> dict | None:
+        """从数据库加载并解密 AI 配置"""
         try:
             entropy = self._get_entropy()
             with self._connect() as conn:
@@ -190,6 +204,7 @@ class AIConfigStore:
             return None
 
     def save_ai_config(self, config: dict) -> None:
+        """加密并保存 AI 配置到数据库"""
         try:
             plain = json.dumps(config, ensure_ascii=False).encode("utf-8")
             entropy = self._get_entropy()
@@ -209,13 +224,14 @@ class AIConfigStore:
             return
 
 class AISettingsDialog(tk.Toplevel):
+    """AI 参数设置弹窗"""
     def __init__(self, parent, initial_config):
         super().__init__(parent)
         self.title("AI 设置")
         self.geometry("400x420")
         self.resizable(False, False)
         
-        # Center window
+        # 窗口居中
         self.update_idletasks()
         width = 400
         height = 420
@@ -227,7 +243,6 @@ class AISettingsDialog(tk.Toplevel):
         self.result = None
         self.configure(bg=parent._colors["bg"])
         
-        # Style mapping
         self._colors = parent._colors
         self._fonts = parent._fonts
         
@@ -236,6 +251,7 @@ class AISettingsDialog(tk.Toplevel):
         self.grab_set()
         
     def _init_ui(self, config):
+        """初始化 AI 设置界面"""
         frame = ttk.Frame(self, style="App.TFrame", padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         
@@ -265,16 +281,16 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="保存", command=self._save, style="Primary.TButton").pack(side=tk.RIGHT)
 
     def _on_provider_change(self, event):
+        """切换厂商时自动填充默认参数"""
         provider = self.provider_var.get()
         info = AIService.PROVIDERS.get(provider, {})
-        # Only auto-fill if empty or user wants to reset? For now, keep it simple.
-        # If user switches provider, they likely want defaults if they haven't set custom ones.
         if not self.base_url_var.get():
             self.base_url_var.set(info.get("base_url", ""))
         if not self.model_var.get():
             self.model_var.set(info.get("model", ""))
 
     def _save(self):
+        """保存设置并关闭弹窗"""
         self.result = {
             "provider": self.provider_var.get(),
             "api_key": self.api_key_var.get().strip(),
@@ -284,6 +300,7 @@ class AISettingsDialog(tk.Toplevel):
         self.destroy()
 
 class AIExclusionConfirmDialog(tk.Toplevel):
+    """AI 排除建议确认弹窗"""
     def __init__(self, parent, suggestions):
         super().__init__(parent)
         self.title("AI 智能排除确认")
@@ -291,7 +308,7 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         self.resizable(True, True)
         self.configure(bg=parent._colors["bg"])
         
-        # Center window
+        # 窗口居中
         self.update_idletasks()
         width = 600
         height = 500
@@ -308,10 +325,11 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         self.grab_set()
         
     def _init_ui(self, parent):
+        """初始化建议确认界面"""
         frame = ttk.Frame(self, style="App.TFrame", padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         
-        # Title & Analysis (Scrollable)
+        # 顶部 AI 分析说明（可滚动）
         analysis = self.suggestions.get("analysis", "AI 已完成分析。")
         
         analysis_frame = ttk.Frame(frame, style="App.TFrame")
@@ -331,7 +349,7 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         
         ttk.Label(frame, text="建议排除以下项目（可点击取消勾选）：", style="Title.TLabel", font=parent._fonts["subtitle"]).pack(anchor=tk.W, pady=(0, 10))
         
-        # Treeview Table
+        # 建议项目列表（表格形式）
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
         
@@ -352,8 +370,8 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ysb.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Populate
-        self.items = [] # list of dict: {id, type, name, checked}
+        # 填充数据
+        self.items = []
         
         for d in self.suggestions.get("excluded_dirs", []):
             self._add_item("目录", d)
@@ -361,7 +379,7 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         for e in self.suggestions.get("excluded_extensions", []):
             self._add_item("后缀", e)
             
-        # Bind click
+        # 绑定交互事件
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", self._toggle_selection)
 
@@ -372,10 +390,11 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="确认排除", command=self._confirm, style="Primary.TButton").pack(side=tk.RIGHT)
 
     def _add_item(self, type_str, name):
+        """向表格中添加建议项"""
         item_id = self.tree.insert("", tk.END, values=("☑", type_str, name))
-        # Tag for coloring rows if needed, but let's keep simple
     
     def _on_click(self, event):
+        """点击表格行切换勾选状态"""
         region = self.tree.identify("region", event.x, event.y)
         if region == "heading":
             return
@@ -385,11 +404,13 @@ class AIExclusionConfirmDialog(tk.Toplevel):
             self._toggle_item(item_id)
 
     def _toggle_selection(self, event):
+        """空格键切换勾选状态"""
         item_id = self.tree.focus()
         if item_id:
             self._toggle_item(item_id)
 
     def _toggle_item(self, item_id):
+        """切换单行勾选状态图标"""
         values = self.tree.item(item_id, "values")
         if not values: return
         
@@ -399,6 +420,7 @@ class AIExclusionConfirmDialog(tk.Toplevel):
         self.tree.item(item_id, values=(new_check, values[1], values[2]))
 
     def _confirm(self):
+        """汇总确认结果并关闭"""
         self.selected_dirs = []
         self.selected_exts = []
         
@@ -469,6 +491,7 @@ class MainApplication(tk.Tk):
         self._init_ui()
         
     def _init_ui(self):
+        """初始化主界面布局"""
         container = ttk.Frame(self, style="App.TFrame")
         container.grid(row=0, column=0, sticky="nsew")
         self.grid_rowconfigure(0, weight=1)
@@ -477,6 +500,7 @@ class MainApplication(tk.Tk):
         container.grid_rowconfigure(1, weight=1)
         container.grid_columnconfigure(0, weight=1)
 
+        # 顶部工具栏
         topbar = ttk.Frame(container, style="Top.TFrame", padding=(18, 14))
         topbar.grid(row=0, column=0, sticky="ew")
         topbar.grid_columnconfigure(0, weight=1)
@@ -502,26 +526,30 @@ class MainApplication(tk.Tk):
         ttk.Button(tools, text="AI 设置", command=self._show_ai_settings, style="Secondary.TButton").grid(row=0, column=2, padx=(0, 8))
         ttk.Button(tools, text="帮助", command=self._show_help, style="Secondary.TButton").grid(row=0, column=3, padx=(0, 8))
         
-        # Author Link
+        # 作者链接
         author_link = ttk.Label(tools, text="GitHub", style="Muted.TLabel", cursor="hand2")
         author_link.grid(row=0, column=4, padx=(5, 0))
         author_link.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/XiaoChennnng/SoftCopyRightDocGen"))
 
+        # 主内容区域布局
         content = ttk.Frame(container, style="App.TFrame", padding=(18, 14, 18, 16))
         content.grid(row=1, column=0, sticky="nsew")
         content.grid_columnconfigure(0, weight=3)
         content.grid_columnconfigure(1, weight=2)
         content.grid_rowconfigure(0, weight=1)
 
+        # 左侧配置面板
         left = ttk.Frame(content, style="App.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         left.grid_columnconfigure(0, weight=1)
 
+        # 右侧状态面板
         right = ttk.Frame(content, style="App.TFrame")
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(0, weight=1)
 
+        # 数据绑定变量
         self.name_var = tk.StringVar()
         self.version_var = tk.StringVar(value="V1.0.0")
         self.project_dir_var = tk.StringVar()
@@ -539,17 +567,18 @@ class MainApplication(tk.Tk):
         
         self.remove_comments_var = tk.BooleanVar(value=False)
 
+        # 构建各个卡片组件
         self._build_card_software(left)
         self._build_card_paths(left)
         self._build_card_notes(left)
         self._build_actions(left)
-
         self._build_status_panel(right)
 
         self._refresh_open_buttons()
         self._start_log_flusher()
 
     def _show_ai_settings(self):
+        """显示 AI 设置对话框"""
         dialog = AISettingsDialog(self, self.ai_config)
         self.wait_window(dialog)
         if dialog.result:
@@ -558,6 +587,7 @@ class MainApplication(tk.Tk):
             self._log("AI 配置已更新", level="key")
 
     def _run_ai_analysis(self):
+        """运行 AI 智能分析任务"""
         project_dir = self.project_dir_var.get().strip()
         if not project_dir or not os.path.isdir(project_dir):
             messagebox.showwarning("提示", "请先选择有效的项目目录！")
@@ -566,10 +596,10 @@ class MainApplication(tk.Tk):
         if not self.ai_config.get("api_key"):
             self._show_ai_settings()
             if not self.ai_config.get("api_key"):
-                return # User cancelled or didn't input key
+                return # 用户取消或未输入 key
 
-        # Disable UI
-        self._set_running(True) # Re-use this to lock UI
+        # 锁定 UI 并更新状态
+        self._set_running(True)
         self._set_status("正在进行 AI 分析…")
         self._set_progress(0)
         self._clear_log()
@@ -591,7 +621,7 @@ class MainApplication(tk.Tk):
                 
                 suggestions = service.suggest_exclusions(dirs, exts)
                 
-                # Show confirm dialog in main thread
+                # 在主线程中弹出确认框
                 self.after(0, lambda: self._show_exclusion_confirm(suggestions))
                 
             except Exception as e:
@@ -605,6 +635,7 @@ class MainApplication(tk.Tk):
         threading.Thread(target=run, daemon=True).start()
 
     def _show_exclusion_confirm(self, suggestions):
+        """显示并处理排除建议确认"""
         dialog = AIExclusionConfirmDialog(self, suggestions)
         self.wait_window(dialog)
         
@@ -620,15 +651,17 @@ class MainApplication(tk.Tk):
             self._log("未设置任何排除项")
 
     def _browse_project_dir(self):
+        """浏览并选择项目目录"""
         path = filedialog.askdirectory()
         if path:
             self.project_dir_var.set(path)
-            # Auto set output path if empty
+            # 自动填充输出路径
             if not self.output_path_var.get():
                 name = self.name_var.get() or "SourceCode"
                 self.output_path_var.set(os.path.join(path, f"{name}_SourceCode.pdf"))
 
     def _browse_output_file(self):
+        """浏览并选择 PDF 保存位置"""
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")]
@@ -637,11 +670,11 @@ class MainApplication(tk.Tk):
             self.output_path_var.set(path)
 
     def _build_card_software(self, parent: ttk.Frame):
+        """构建软件信息卡片"""
         card = ttk.LabelFrame(parent, text="软件信息", style="Card.TLabelframe", padding=(14, 12))
         card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(1, weight=1)
 
-        # Center vertically with entry
         ttk.Label(card, text="软件全称", style="CardLabel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.name_entry = ttk.Entry(card, textvariable=self.name_var, style="App.TEntry", width=25)
         self.name_entry.grid(row=0, column=1, sticky="ew", pady=(0, 8))
@@ -651,6 +684,7 @@ class MainApplication(tk.Tk):
         self.version_entry.grid(row=1, column=1, sticky="ew")
 
     def _build_card_paths(self, parent: ttk.Frame):
+        """构建路径设置卡片"""
         card = ttk.LabelFrame(parent, text="路径设置", style="Card.TLabelframe", padding=(14, 12))
         card.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(1, weight=1)
@@ -666,6 +700,7 @@ class MainApplication(tk.Tk):
         ttk.Button(card, text="浏览", command=self._browse_output_file, style="Secondary.TButton").grid(row=1, column=2, padx=(10, 0))
 
     def _build_card_notes(self, parent: ttk.Frame):
+        """构建选项设置卡片"""
         card = ttk.LabelFrame(parent, text="选项", style="Card.TLabelframe", padding=(14, 12))
         card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
@@ -675,16 +710,13 @@ class MainApplication(tk.Tk):
         
         cb = ttk.Checkbutton(card, text="生成时移除代码注释", variable=self.remove_comments_var)
         cb.grid(row=1, column=0, sticky="w")
-        # Ensure checkbutton background matches
-        # cb.configure(style="App.TCheckbutton") # If we had one, but default usually picks up parent bg if theme is right
-
 
     def _build_actions(self, parent: ttk.Frame):
+        """构建操作按钮栏"""
         actions = ttk.Frame(parent, style="App.TFrame")
         actions.grid(row=3, column=0, sticky="ew")
-        # Give more weight to the first column (Generate button)
         actions.grid_columnconfigure(0, weight=2)
-        actions.grid_columnconfigure(1, weight=2) # AI Button
+        actions.grid_columnconfigure(1, weight=2)
         actions.grid_columnconfigure(2, weight=1)
         actions.grid_columnconfigure(3, weight=1)
 
@@ -703,6 +735,7 @@ class MainApplication(tk.Tk):
         )
 
     def _build_status_panel(self, parent: ttk.Frame):
+        """构建右侧运行状态面板"""
         panel = ttk.LabelFrame(parent, text="运行状态", style="Card.TLabelframe", padding=(14, 12))
         panel.grid(row=0, column=0, sticky="nsew")
         panel.grid_columnconfigure(0, weight=1)
@@ -720,6 +753,7 @@ class MainApplication(tk.Tk):
         self.progress_bar = ttk.Progressbar(panel, variable=self.progress_var, maximum=100, style="App.Horizontal.TProgressbar")
         self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(10, 10))
 
+        # 指标展示网格
         metrics = ttk.Frame(panel, style="App.TFrame")
         metrics.grid(row=2, column=0, sticky="ew")
         for c in range(4):
@@ -730,10 +764,11 @@ class MainApplication(tk.Tk):
         self._metric_cell(metrics, 0, 2, "行数", self.metric_lines_var)
         self._metric_cell(metrics, 0, 3, "页数", self.metric_output_pages_var)
 
+        # 日志输出区域
         log_box = ttk.Frame(panel, style="App.TFrame")
         log_box.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
         log_box.grid_rowconfigure(1, weight=1)
-        log_box.grid_columnconfigure(0, weight=1)
+        log_columnconfigure = log_box.grid_columnconfigure(0, weight=1)
 
         log_header = ttk.Frame(log_box, style="App.TFrame")
         log_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -780,11 +815,13 @@ class MainApplication(tk.Tk):
         yscroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=yscroll.set)
 
+        # 配置日志颜色标签
         self.log_text.tag_configure("muted", foreground=self._colors["muted"])
         self.log_text.tag_configure("danger", foreground=self._colors["danger"])
         self.log_text.tag_configure("key", foreground=self._colors["accent"])
 
     def _metric_cell(self, parent: ttk.Frame, row: int, col: int, title: str, value_var: tk.StringVar):
+        """构建单个指标展示单元格"""
         cell = ttk.Frame(parent, style="Metric.TFrame", padding=(10, 8))
         cell.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0), pady=(0, 10))
         cell.grid_columnconfigure(0, weight=1)
@@ -792,9 +829,10 @@ class MainApplication(tk.Tk):
         ttk.Label(cell, textvariable=value_var, style="MetricValue.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
 
     def _apply_theme(self):
+        """应用全局视觉主题与样式"""
         self.configure(bg=self._colors["bg"])
 
-        # Use 10pt for better fit on Windows standard DPI
+        # 设置默认字体
         base_font = tkfont.nametofont("TkDefaultFont")
         base_font.configure(family="Microsoft YaHei UI", size=9)
         text_font = tkfont.nametofont("TkTextFont")
@@ -814,6 +852,7 @@ class MainApplication(tk.Tk):
         except tk.TclError:
             pass
 
+        # 配置各个组件样式
         style.configure("App.TFrame", background=self._colors["bg"])
         style.configure("Top.TFrame", background=self._colors["bg"])
 
@@ -835,7 +874,7 @@ class MainApplication(tk.Tk):
 
         style.configure("Status.TLabel", background=self._colors["surface"], foreground=self._colors["text"], font=self._fonts["subtitle"])
 
-        # Optimized Entry padding for better vertical alignment
+        # 输入框样式
         style.configure(
             "App.TEntry",
             fieldbackground=self._colors["bg"],
@@ -847,7 +886,7 @@ class MainApplication(tk.Tk):
             padding=(5, 6) 
         )
 
-        # Reduced button padding for compactness
+        # 按钮样式
         style.configure(
             "Primary.TButton",
             padding=(10, 4),
@@ -909,18 +948,21 @@ class MainApplication(tk.Tk):
         style.map("App.TCombobox", fieldbackground=[("readonly", self._colors["bg"])])
 
     def _refresh_open_buttons(self):
+        """刷新打开文件按钮的状态"""
         if self._last_output_path and os.path.isfile(self._last_output_path):
             self.open_pdf_btn.state(["!disabled"])
         else:
             self.open_pdf_btn.state(["disabled"])
 
     def _show_help(self):
+        """显示帮助信息"""
         messagebox.showinfo(
             "帮助",
             "1) 填写软件全称与版本号\n2) 选择项目目录与 PDF 保存位置\n3) 点击开始生成，等待完成\n\n提示：生成过程中可点击停止取消任务。",
         )
 
     def _open_output_dir(self):
+        """打开输出目录"""
         path = self.output_path_var.get().strip() or self._last_output_path
         if not path:
             return
@@ -929,16 +971,19 @@ class MainApplication(tk.Tk):
             os.startfile(directory)
 
     def _open_output_pdf(self):
+        """直接打开生成的 PDF 文件"""
         path = self._last_output_path or self.output_path_var.get().strip()
         if path and os.path.isfile(path):
             os.startfile(path)
 
     def _copy_log(self):
+        """将当前日志记录复制到剪贴板"""
         text = "\n".join(msg for _lvl, msg in self._log_records)
         self.clipboard_clear()
         self.clipboard_append(text)
 
     def _clear_log(self):
+        """清空界面日志展示与内部记录缓存"""
         self._log_records.clear()
         if hasattr(self, "_log_queue"):
             try:
@@ -951,6 +996,7 @@ class MainApplication(tk.Tk):
         self.log_text.config(state="disabled")
 
     def _refresh_log_view(self):
+        """根据当前过滤器重新渲染日志视图"""
         mode = self.log_filter_var.get()
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
@@ -963,10 +1009,12 @@ class MainApplication(tk.Tk):
         self.log_text.config(state="disabled")
 
     def _start_log_flusher(self):
+        """启动日志刷新定时任务"""
         if getattr(self, "_log_flush_job", None) is None:
             self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
 
     def _flush_log_queue(self):
+        """将日志队列中的消息批量刷新到界面"""
         if not hasattr(self, "log_text") or not hasattr(self, "_log_queue"):
             self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
             return
@@ -992,6 +1040,7 @@ class MainApplication(tk.Tk):
         self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
 
     def _log(self, message: str, level: str = "detail"):
+        """记录一条新日志并放入待刷新队列"""
         self._log_records.append((level, message))
         if hasattr(self, "_log_queue"):
             try:
@@ -1000,6 +1049,7 @@ class MainApplication(tk.Tk):
                 pass
 
     def _stop_generation(self):
+        """向生成线程发送停止信号"""
         if hasattr(self, 'stop_event'):
             self.stop_event.set()
             self._set_status("正在停止任务…")
@@ -1007,6 +1057,7 @@ class MainApplication(tk.Tk):
             self.stop_btn.state(["disabled"])
 
     def _start_generation(self):
+        """预校验并启动文档生成线程"""
         name = self.name_var.get().strip()
         version = self.version_var.get().strip()
         project_dir = self.project_dir_var.get().strip()
@@ -1032,7 +1083,7 @@ class MainApplication(tk.Tk):
         
         self.stop_event = threading.Event()
         
-        # Pass current custom exclusions
+        # 汇总当前的排除项
         custom_dirs = list(self.custom_excluded_dirs)
         custom_exts = list(self.custom_excluded_exts)
         remove_comments = self.remove_comments_var.get()
@@ -1045,6 +1096,7 @@ class MainApplication(tk.Tk):
         thread.start()
         
     def _process_task(self, name, version, project_dir, output_path, custom_dirs=None, custom_exts=None, remove_comments=False):
+        """文档生成的核心工作流程（后台线程执行）"""
         check_cancel = lambda: self.stop_event.is_set()
         start_time = time.time()
         
@@ -1096,6 +1148,7 @@ class MainApplication(tk.Tk):
 
                 return idx, path.name, content, len(content.splitlines()), True
 
+            # 使用多线程加速文件读取
             max_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
             futures = []
             completed = 0
@@ -1172,6 +1225,7 @@ class MainApplication(tk.Tk):
             self.after(0, lambda: self._set_running(False))
 
     def _set_running(self, running: bool):
+        """切换界面运行/空闲状态的 UI 锁定"""
         if running:
             self.generate_btn.state(["disabled"])
             self.ai_btn.state(["disabled"])
@@ -1194,6 +1248,7 @@ class MainApplication(tk.Tk):
             self._refresh_open_buttons()
 
     def _start_elapsed_timer(self):
+        """开启耗时统计计时器"""
         self._elapsed_job = None
 
         def tick():
@@ -1212,6 +1267,7 @@ class MainApplication(tk.Tk):
         tick()
 
     def _stop_elapsed_timer(self):
+        """停止并清除计时器任务"""
         if getattr(self, "_elapsed_job", None):
             try:
                 self.after_cancel(self._elapsed_job)
@@ -1220,12 +1276,15 @@ class MainApplication(tk.Tk):
         self._elapsed_job = None
 
     def _set_status(self, text: str):
+        """线程安全地更新状态文本"""
         self.after(0, lambda: self.status_var.set(text))
 
     def _set_progress(self, value: float):
+        """线程安全地更新进度条"""
         self.after(0, lambda: self.progress_var.set(max(0, min(100, value))))
 
     def _set_metric(self, var: tk.StringVar, value: str):
+        """线程安全地更新指标数值"""
         self.after(0, lambda: var.set(value))
 
 if __name__ == "__main__":

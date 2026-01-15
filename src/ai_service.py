@@ -3,6 +3,7 @@ import httpx
 from typing import List, Dict, Any, Optional
 
 class AIService:
+    # AI 模型服务商配置
     PROVIDERS = {
         "DeepSeek": {
             "base_url": "https://api.deepseek.com",
@@ -21,7 +22,7 @@ class AIService:
         },
         "Doubao (火山引擎)": {
             "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-            "model": "ep-20240604-xxxxx", # 用户需手动填Endpoint ID，这里只做示例
+            "model": "ep-20240604-xxxxx", # 用户需手动填 Endpoint ID
             "type": "openai"
         },
         "Gemini (Google)": {
@@ -42,6 +43,7 @@ class AIService:
     }
 
     def __init__(self, provider: str, api_key: str, custom_base_url: str = "", custom_model: str = ""):
+        """初始化 AI 服务实例"""
         self.provider = provider
         self.api_key = api_key
         
@@ -51,9 +53,7 @@ class AIService:
         self.api_type = config.get("type", "openai")
 
     def suggest_exclusions(self, dirs: List[str], extensions: List[str]) -> Dict[str, List[str]]:
-        """
-        Send directory structure to AI and get suggested exclusions.
-        """
+        """向 AI 发送目录结构并获取排除建议"""
         prompt = self._build_prompt(dirs, extensions)
         
         try:
@@ -69,6 +69,7 @@ class AIService:
             raise Exception(f"AI 请求失败: {str(e)}")
 
     def _build_prompt(self, dirs: List[str], extensions: List[str]) -> str:
+        """构建 AI 提示词"""
         return f"""
 你是一位拥有 10 年经验的资深软件著作权审查专家。你的任务是协助开发者从项目目录中精准剔除“非源代码”文件，以生成符合软著申请要求的精简代码文档。
 
@@ -101,6 +102,7 @@ class AIService:
 """
 
     def _call_openai_compatible(self, prompt: str) -> Dict[str, Any]:
+        """调用 OpenAI 兼容接口"""
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -121,6 +123,7 @@ class AIService:
         return self._parse_json(content)
 
     def _call_anthropic(self, prompt: str) -> Dict[str, Any]:
+        """调用 Anthropic 接口"""
         url = f"{self.base_url}/messages"
         headers = {
             "x-api-key": self.api_key,
@@ -141,7 +144,8 @@ class AIService:
         return self._parse_json(content)
 
     def _call_google(self, prompt: str) -> Dict[str, Any]:
-        # Gemini uses query param for key
+        """调用 Google Gemini 接口"""
+        # Gemini 使用 query 参数传递 key
         url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
         data = {
@@ -156,13 +160,13 @@ class AIService:
         return self._parse_json(content)
 
     def _parse_json(self, content: str) -> Dict[str, Any]:
-        # Clean up markdown code blocks if present
+        """解析并清洗 AI 返回的 JSON 字符串"""
         content = content.strip()
+        # 清除 Markdown 代码块标记
         if content.startswith("```"):
             content = content.split("\n", 1)[1]
             if content.endswith("```"):
                 content = content.rsplit("\n", 1)[0]
-        # Remove json label if exists
         content = content.replace("```json", "").replace("```", "")
         
         return json.loads(content)
