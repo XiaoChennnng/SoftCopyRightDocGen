@@ -6,6 +6,8 @@ from typing import List, Optional
 import re
 import tokenize
 import io
+import threading
+import queue
 
 class Scanner:
     DEFAULT_EXCLUDED_DIRS = {
@@ -155,34 +157,86 @@ class Scanner:
         check_cancel: Optional callable that returns True if scan should be cancelled.
         progress_callback: Optional callable(scanned_count, current_path)
         """
+        return self.scan_parallel(check_cancel=check_cancel, progress_callback=progress_callback)
+
+    def scan_parallel(self, check_cancel=None, progress_callback=None, max_workers: int | None = None) -> List[pathlib.Path]:
         valid_files = []
         scanned_count = 0
-        
+
         if not self.root_dir.exists():
             return []
 
-        for root, dirs, files in os.walk(self.root_dir):
-            if check_cancel and check_cancel():
-                return []
+        if max_workers is None:
+            max_workers = min(24, max(4, (os.cpu_count() or 4) * 2))
 
-            # Modify dirs in-place to exclude directories
-            # Also notify progress about directory change if needed, but per-file is better for count
-            dirs[:] = [d for d in dirs if d not in self.excluded_dirs and not d.startswith('.')]
-            
-            for file in files:
-                if check_cancel and check_cancel():
-                    return []
-                    
-                file_path = pathlib.Path(root) / file
-                scanned_count += 1
-                
-                if self._is_valid_file(file_path):
-                    valid_files.append(file_path)
-                
-                # Report progress every 50 files or so to avoid UI flooding
-                if progress_callback and scanned_count % 50 == 0:
-                    progress_callback(len(valid_files), file_path)
-        
+        lock = threading.Lock()
+        q: queue.Queue[str | None] = queue.Queue()
+        q.put(str(self.root_dir))
+
+        cancel_flag = threading.Event()
+
+        def worker():
+            nonlocal scanned_count
+            while True:
+                if cancel_flag.is_set():
+                    break
+                try:
+                    dir_path = q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    if dir_path is None:
+                        break
+
+                    if check_cancel and check_cancel():
+                        cancel_flag.set()
+                        continue
+
+                    try:
+                        with os.scandir(dir_path) as it:
+                            for entry in it:
+                                if cancel_flag.is_set() or (check_cancel and check_cancel()):
+                                    cancel_flag.set()
+                                    break
+
+                                name = entry.name
+                                if entry.is_dir(follow_symlinks=False):
+                                    if name.startswith('.') or name in self.excluded_dirs:
+                                        continue
+                                    q.put(entry.path)
+                                elif entry.is_file(follow_symlinks=False):
+                                    file_path = pathlib.Path(entry.path)
+                                    with lock:
+                                        scanned_count += 1
+                                        local_scanned = scanned_count
+
+                                    if self._is_valid_file(file_path):
+                                        with lock:
+                                            valid_files.append(file_path)
+                                            local_valid = len(valid_files)
+                                    else:
+                                        local_valid = None
+
+                                    if progress_callback and local_scanned % 200 == 0:
+                                        progress_callback(local_valid if local_valid is not None else len(valid_files), file_path)
+                    except (PermissionError, FileNotFoundError, NotADirectoryError):
+                        pass
+                finally:
+                    q.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(max_workers)]
+        for t in threads:
+            t.start()
+
+        q.join()
+        for _ in threads:
+            q.put(None)
+        for t in threads:
+            t.join(timeout=1)
+
+        if cancel_flag.is_set():
+            return []
+
         # Final report
         if progress_callback:
             progress_callback(len(valid_files), "Done")
@@ -206,33 +260,27 @@ class Scanner:
         Reads file content with auto-encoding detection.
         """
         try:
-            # First try reading as binary to detect encoding
             raw_data = file_path.read_bytes()
             if not raw_data:
                 return ""
-                
+
+            try:
+                return raw_data.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+
+            try:
+                return raw_data.decode("gbk")
+            except UnicodeDecodeError:
+                pass
+
             result = chardet.detect(raw_data)
-            encoding = result['encoding']
-            
-            if not encoding:
-                # Fallback to utf-8 if detection fails
-                encoding = 'utf-8'
-            
-            # If confidence is low, might be binary file that slipped through?
-            # But let's try decoding.
-            
+            encoding = result.get('encoding') or 'utf-8'
+
             try:
                 return raw_data.decode(encoding)
             except (UnicodeDecodeError, LookupError):
-                # Fallback strategies
-                try:
-                    return raw_data.decode('utf-8')
-                except UnicodeDecodeError:
-                    try:
-                        return raw_data.decode('gbk')
-                    except UnicodeDecodeError:
-                        # Last resort: ignore errors or return empty
-                        return raw_data.decode('utf-8', errors='ignore')
+                return raw_data.decode('utf-8', errors='ignore')
                         
         except Exception as e:
             print(f"Error reading file {file_path}: {e}")

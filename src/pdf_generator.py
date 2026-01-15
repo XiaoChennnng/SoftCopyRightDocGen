@@ -39,15 +39,9 @@ class PDFGenerator:
             # Adjust strategy if needed, but 9pt/11leading on A4 gives ~68 lines. Safe.
 
         # Calculate char width for wrapping (approximate for monospaced/SimSun)
-        # SimSun is roughly monospaced for Chinese, but variable for ASCII in some contexts? 
-        # Actually standard SimSun is proportional for ASCII usually? 
-        # Let's assume average char width or strict wrapping.
-        # ReportLab's stringWidth can measure.
         self.avg_char_width = pdfmetrics.stringWidth('A', self.font_name, self.font_size)
-        # A safer way is to measure max characters that fit in content_width
-        # For simplicity in "textwrap", we need a character count.
-        # Let's estimate conservatively.
         self.chars_per_line = int(self.content_width / self.avg_char_width)
+        self._char_width_cache = {}
 
     def _register_font(self):
         try:
@@ -189,36 +183,35 @@ class PDFGenerator:
         return pages
 
     def _wrap_line(self, line):
-        """
-        Wraps a single line into multiple lines based on accurate string width calculation.
-        Supports mixed CJK and ASCII content.
-        """
         if not line:
             return [""]
-        
+
+        full_width = pdfmetrics.stringWidth(line, self.font_name, self.font_size)
+        if full_width <= self.content_width:
+            return [line]
+
         wrapped_lines = []
-        current_line_accum = ""
-        current_width = 0
-        
-        # Optimization: stringWidth call overhead is real.
-        # However, for correct PDF generation, we must be precise.
-        # Let's iterate char by char or use a smarter split.
-        
+        current_chars = []
+        current_width = 0.0
+        cache = self._char_width_cache
+
         for char in line:
-            char_width = pdfmetrics.stringWidth(char, self.font_name, self.font_size)
-            
-            if current_width + char_width > self.content_width:
-                # Wrap
-                wrapped_lines.append(current_line_accum)
-                current_line_accum = char
-                current_width = char_width
+            width = cache.get(char)
+            if width is None:
+                width = pdfmetrics.stringWidth(char, self.font_name, self.font_size)
+                cache[char] = width
+
+            if current_chars and current_width + width > self.content_width:
+                wrapped_lines.append("".join(current_chars))
+                current_chars = [char]
+                current_width = width
             else:
-                current_line_accum += char
-                current_width += char_width
-                
-        if current_line_accum:
-            wrapped_lines.append(current_line_accum)
-            
+                current_chars.append(char)
+                current_width += width
+
+        if current_chars:
+            wrapped_lines.append("".join(current_chars))
+
         return wrapped_lines
 
     def _draw_header(self, c, page_num):
@@ -246,4 +239,3 @@ class PDFGenerator:
         for line in lines:
             y -= self.leading
             c.drawString(self.margin_left, y, line)
-

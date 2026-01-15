@@ -1,13 +1,212 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import queue
 import os
 import pathlib
 import time
+import sqlite3
+import json
+import base64
+import ctypes
+from ctypes import wintypes
+import secrets
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter.font as tkfont
 from .scanner import Scanner
 from .pdf_generator import PDFGenerator
 from .ai_service import AIService
+
+
+class AIConfigStore:
+    def __init__(self, app_name: str = "SoftCopyRightDocGen"):
+        self.app_name = app_name
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        self._DATA_BLOB = _DATA_BLOB
+        self._crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._CryptProtectData = self._crypt32.CryptProtectData
+        self._CryptUnprotectData = self._crypt32.CryptUnprotectData
+        self._CryptProtectData.argtypes = [
+            ctypes.POINTER(self._DATA_BLOB),
+            wintypes.LPCWSTR,
+            ctypes.POINTER(self._DATA_BLOB),
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(self._DATA_BLOB),
+        ]
+        self._CryptProtectData.restype = wintypes.BOOL
+        self._CryptUnprotectData.argtypes = [
+            ctypes.POINTER(self._DATA_BLOB),
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(self._DATA_BLOB),
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(self._DATA_BLOB),
+        ]
+        self._CryptUnprotectData.restype = wintypes.BOOL
+
+    def _base_dir(self) -> str:
+        return str(pathlib.Path(__file__).resolve().parent.parent)
+
+    def _db_dir(self) -> str:
+        return os.path.join(self._base_dir(), "data")
+
+    def _db_path(self) -> str:
+        return os.path.join(self._db_dir(), "settings.db")
+
+    def _entropy_path(self) -> str:
+        return os.path.join(self._db_dir(), "entropy.bin")
+
+    def _connect(self) -> sqlite3.Connection:
+        os.makedirs(self._db_dir(), exist_ok=True)
+        conn = sqlite3.connect(self._db_path())
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        return conn
+
+    def _legacy_db_path(self) -> str:
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, self.app_name, "settings.db")
+
+    def _get_entropy(self) -> bytes:
+        os.makedirs(self._db_dir(), exist_ok=True)
+        path = self._entropy_path()
+        try:
+            if os.path.isfile(path):
+                data = pathlib.Path(path).read_bytes()
+                if data:
+                    return data
+        except Exception:
+            pass
+
+        data = secrets.token_bytes(32)
+        try:
+            with open(path, "xb") as f:
+                f.write(data)
+        except FileExistsError:
+            try:
+                existing = pathlib.Path(path).read_bytes()
+                if existing:
+                    return existing
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return data
+
+    def _dpapi_encrypt(self, data: bytes, entropy: bytes) -> bytes | None:
+        if not data:
+            return b""
+        ent_buf = ctypes.create_string_buffer(entropy)
+        blob_entropy = self._DATA_BLOB(len(entropy), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_ubyte)))
+        buf = ctypes.create_string_buffer(data)
+        blob_in = self._DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+        blob_out = self._DATA_BLOB()
+        ok = self._CryptProtectData(ctypes.byref(blob_in), None, ctypes.byref(blob_entropy), None, None, 0, ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            self._kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+    def _dpapi_decrypt(self, data: bytes, entropy: bytes) -> bytes | None:
+        if data is None:
+            return None
+        if data == b"":
+            return b""
+        ent_buf = ctypes.create_string_buffer(entropy)
+        blob_entropy = self._DATA_BLOB(len(entropy), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_ubyte)))
+        buf = ctypes.create_string_buffer(data)
+        blob_in = self._DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+        blob_out = self._DATA_BLOB()
+        ok = self._CryptUnprotectData(ctypes.byref(blob_in), None, ctypes.byref(blob_entropy), None, None, 0, ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            self._kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+    def _load_ai_config_from_db(self, db_path: str) -> dict | None:
+        try:
+            if not os.path.isfile(db_path):
+                return None
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                row = conn.execute("SELECT value FROM settings WHERE key = ?", ("ai_config",)).fetchone()
+                if not row:
+                    return None
+                value = row[0]
+                data = json.loads(value)
+                return data if isinstance(data, dict) else None
+            finally:
+                conn.close()
+        except Exception:
+            return None
+
+    def migrate_legacy_if_needed(self) -> None:
+        try:
+            existing = self.load_ai_config()
+            if existing:
+                return
+            legacy = self._load_ai_config_from_db(self._legacy_db_path())
+            if legacy and isinstance(legacy, dict):
+                self.save_ai_config(legacy)
+        except Exception:
+            return
+
+    def load_ai_config(self) -> dict | None:
+        try:
+            entropy = self._get_entropy()
+            with self._connect() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key = ?", ("ai_config",)).fetchone()
+                if not row:
+                    return None
+                obj = json.loads(row[0])
+                if not isinstance(obj, dict):
+                    return None
+                if obj.get("enc") == "dpapi" and isinstance(obj.get("data"), str):
+                    raw = base64.b64decode(obj["data"].encode("ascii"))
+                    plain = self._dpapi_decrypt(raw, entropy)
+                    if plain is None:
+                        return None
+                    decoded = json.loads(plain.decode("utf-8"))
+                    return decoded if isinstance(decoded, dict) else None
+                return obj
+        except Exception:
+            return None
+
+    def save_ai_config(self, config: dict) -> None:
+        try:
+            plain = json.dumps(config, ensure_ascii=False).encode("utf-8")
+            entropy = self._get_entropy()
+            enc = self._dpapi_encrypt(plain, entropy)
+            if enc is None:
+                return
+            payload = json.dumps(
+                {"enc": "dpapi", "data": base64.b64encode(enc).decode("ascii")},
+                ensure_ascii=False,
+            )
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("ai_config", payload),
+                )
+        except Exception:
+            return
 
 class AISettingsDialog(tk.Toplevel):
     def __init__(self, parent, initial_config):
@@ -233,6 +432,15 @@ class MainApplication(tk.Tk):
             "base_url": "",
             "model": ""
         }
+
+        self._ai_config_store = AIConfigStore()
+        self._ai_config_store.migrate_legacy_if_needed()
+        stored = self._ai_config_store.load_ai_config()
+        if isinstance(stored, dict):
+            for k in ("provider", "api_key", "base_url", "model"):
+                v = stored.get(k)
+                if isinstance(v, str):
+                    self.ai_config[k] = v
         self.custom_excluded_dirs = []
         self.custom_excluded_exts = []
 
@@ -251,6 +459,10 @@ class MainApplication(tk.Tk):
         self._log_records: list[tuple[str, str]] = []
         self._task_start_ts: float | None = None
         self._last_output_path: str | None = None
+
+        self._log_queue = queue.Queue()
+        self._log_flush_interval_ms = 80
+        self._log_flush_job = None
 
         self._apply_theme()
         
@@ -335,12 +547,14 @@ class MainApplication(tk.Tk):
         self._build_status_panel(right)
 
         self._refresh_open_buttons()
+        self._start_log_flusher()
 
     def _show_ai_settings(self):
         dialog = AISettingsDialog(self, self.ai_config)
         self.wait_window(dialog)
         if dialog.result:
             self.ai_config = dialog.result
+            self._ai_config_store.save_ai_config(self.ai_config)
             self._log("AI 配置已更新", level="key")
 
     def _run_ai_analysis(self):
@@ -726,6 +940,12 @@ class MainApplication(tk.Tk):
 
     def _clear_log(self):
         self._log_records.clear()
+        if hasattr(self, "_log_queue"):
+            try:
+                while True:
+                    self._log_queue.get_nowait()
+            except queue.Empty:
+                pass
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.config(state="disabled")
@@ -742,17 +962,42 @@ class MainApplication(tk.Tk):
         self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
 
-    def _log(self, message: str, level: str = "detail"):
-        self._log_records.append((level, message))
-        mode = self.log_filter_var.get() if hasattr(self, "log_filter_var") else "全部"
-        if mode == "关键" and level == "detail":
+    def _start_log_flusher(self):
+        if getattr(self, "_log_flush_job", None) is None:
+            self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
+
+    def _flush_log_queue(self):
+        if not hasattr(self, "log_text") or not hasattr(self, "_log_queue"):
+            self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
             return
 
-        tag = "danger" if level == "danger" else ("key" if level == "key" else "muted")
+        mode = self.log_filter_var.get() if hasattr(self, "log_filter_var") else "全部"
         self.log_text.config(state="normal")
-        self.log_text.insert(tk.END, message + "\n", tag)
-        self.log_text.see(tk.END)
+        processed = 0
+        try:
+            while True:
+                level, message = self._log_queue.get_nowait()
+                if mode == "关键" and level == "detail":
+                    continue
+                tag = "danger" if level == "danger" else ("key" if level == "key" else "muted")
+                self.log_text.insert(tk.END, message + "\n", tag)
+                processed += 1
+        except queue.Empty:
+            pass
+
+        if processed:
+            self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
+
+        self._log_flush_job = self.after(self._log_flush_interval_ms, self._flush_log_queue)
+
+    def _log(self, message: str, level: str = "detail"):
+        self._log_records.append((level, message))
+        if hasattr(self, "_log_queue"):
+            try:
+                self._log_queue.put_nowait((level, message))
+            except Exception:
+                pass
 
     def _stop_generation(self):
         if hasattr(self, 'stop_event'):
@@ -833,30 +1078,54 @@ class MainApplication(tk.Tk):
             
             self._set_status("正在读取文件内容…")
             self._set_progress(25)
-            file_contents = []
-            total_lines = 0
             read_start_time = time.time()
+            total_lines = 0
             non_empty_files = 0
-            
-            for i, f in enumerate(files):
+            results: list[tuple[str, str] | None] = [None] * len(files)
+
+            def worker(idx: int, path: pathlib.Path):
                 if check_cancel():
-                    raise Exception("任务已取消")
-                    
-                content = Scanner.read_file_content(f)
-                
+                    return idx, path.name, "", 0, False
+
+                content = Scanner.read_file_content(path)
                 if remove_comments:
-                    content = Scanner.remove_code_comments(content, f.suffix)
-                
-                if content.strip(): # Ignore empty files
-                    file_contents.append((f.name, content))
-                    total_lines += len(content.splitlines())
-                    non_empty_files += 1
-                
-                if i % 25 == 0:
-                    prog = 25 + (i / max(1, len(files))) * 35
-                    msg = f"读取中（{i+1}/{len(files)}）：{f.name}"
-                    self._set_status(msg)
-                    self._set_progress(prog)
+                    content = Scanner.remove_code_comments(content, path.suffix)
+
+                if not content.strip():
+                    return idx, path.name, "", 0, False
+
+                return idx, path.name, content, len(content.splitlines()), True
+
+            max_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
+            futures = []
+            completed = 0
+            last_name = ""
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for i, f in enumerate(files):
+                    futures.append(executor.submit(worker, i, f))
+
+                for fut in as_completed(futures):
+                    if check_cancel():
+                        for f in futures:
+                            f.cancel()
+                        raise Exception("任务已取消")
+
+                    idx, name, content, lines, ok = fut.result()
+                    last_name = name
+                    completed += 1
+
+                    if ok:
+                        results[idx] = (name, content)
+                        total_lines += lines
+                        non_empty_files += 1
+
+                    if completed % 25 == 0 or completed == len(files):
+                        prog = 25 + (completed / max(1, len(files))) * 35
+                        self._set_status(f"读取中（{completed}/{len(files)}）：{last_name}")
+                        self._set_progress(prog)
+
+            file_contents = [r for r in results if r is not None]
             
             read_duration = time.time() - read_start_time
             self._set_metric(self.metric_non_empty_files_var, str(non_empty_files))
