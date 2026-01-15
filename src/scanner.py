@@ -3,6 +3,10 @@ import pathlib
 import chardet
 from typing import List, Optional
 
+import re
+import tokenize
+import io
+
 class Scanner:
     DEFAULT_EXCLUDED_DIRS = {
         'node_modules', 'venv', '.git', '.idea', '__pycache__', 
@@ -19,6 +23,121 @@ class Scanner:
         '.db', '.sqlite', '.sqlite3',
         '.mp3', '.mp4', '.avi', '.mov', '.wav'
     }
+
+    @staticmethod
+    def remove_code_comments(content: str, ext: str) -> str:
+        """
+        Removes comments from code based on file extension.
+        """
+        if not content:
+            return ""
+            
+        ext = ext.lower()
+        
+        # Python
+        if ext in ['.py', '.pyw']:
+            try:
+                # Use tokenize for robust parsing (handles docstrings vs data strings)
+                io_obj = io.BytesIO(content.encode('utf-8'))
+                out = []
+                prev_toktype = tokenize.INDENT
+                last_lineno = -1
+                last_col = 0
+                
+                try:
+                    tokens = tokenize.tokenize(io_obj.readline)
+                except tokenize.TokenError:
+                    return re.sub(r'(?m)^ *#.*\n?', '', content)
+                    
+                for token in tokens:
+                    token_type = token.type
+                    token_string = token.string
+                    start_line, start_col = token.start
+                    end_line, end_col = token.end
+                    
+                    if start_line > last_lineno:
+                        last_col = 0
+                    if start_col > last_col:
+                        out.append(" " * (start_col - last_col))
+                        
+                    if token_type == tokenize.COMMENT:
+                        pass # Remove hash comments
+                    elif token_type == tokenize.STRING:
+                        if prev_toktype in (tokenize.INDENT, tokenize.NEWLINE, tokenize.ENCODING):
+                            pass # Remove docstring
+                        else:
+                            out.append(token_string)
+                    else:
+                        out.append(token_string)
+                        
+                    if token_type not in (tokenize.NL, tokenize.COMMENT):
+                        prev_toktype = token_type
+                        
+                    last_col = end_col
+                    last_lineno = end_line
+                    
+                return "".join(out)
+                
+            except Exception as e:
+                print(f"Error parsing Python comments: {e}")
+                return content
+            
+        # C-style (C, C++, Java, JS, TS, C#, Go, Rust, Swift, Kotlin, etc.)
+        elif ext in ['.c', '.cpp', '.h', '.hpp', '.cc', '.cxx', '.m', '.mm', 
+                     '.java', '.js', '.ts', '.jsx', '.tsx', '.cs', '.go', '.rs', '.swift', '.kt', '.scala',
+                     '.php', '.css', '.scss', '.less']:
+            # Remove // and /* */
+            # Use improved regex to handle strings with escaped quotes correctly
+            pattern = r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|(/\*[\s\S]*?\*/|//.*)'
+            regex = re.compile(pattern, re.MULTILINE)
+            
+            def replace(match):
+                if match.group(2) is not None:
+                    return ""
+                return match.group(1)
+            return regex.sub(replace, content)
+            
+        # HTML/XML
+        elif ext in ['.html', '.htm', '.xml', '.svg', '.vue']:
+            return re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+            
+        # Lua, SQL, etc. can be added if needed
+        
+        return content
+
+    @staticmethod
+    def get_structure_summary(root_dir: str) -> tuple[List[str], List[str]]:
+        """
+        Returns a tuple of (top_level_dirs, all_extensions) for AI analysis.
+        """
+        root = pathlib.Path(root_dir)
+        if not root.exists():
+            return [], []
+
+        top_level_dirs = []
+        extensions = set()
+
+        try:
+            # Get top level dirs
+            for item in root.iterdir():
+                if item.is_dir() and not item.name.startswith('.'):
+                    top_level_dirs.append(item.name)
+            
+            # Walk lightly to find extensions (limit depth or count to avoid slow scan?)
+            # For now, full walk but only collecting extensions is fast enough for typical projects
+            for r, dirs, files in os.walk(root):
+                # Skip hidden dirs to be faster
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext:
+                        extensions.add(ext)
+                        
+        except Exception as e:
+            print(f"Error scanning structure: {e}")
+            
+        return sorted(top_level_dirs), sorted(list(extensions))
 
     def __init__(self, root_dir: str, custom_excluded_dirs: Optional[List[str]] = None, custom_excluded_exts: Optional[List[str]] = None):
         self.root_dir = pathlib.Path(root_dir)
