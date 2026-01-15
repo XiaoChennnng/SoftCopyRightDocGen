@@ -11,9 +11,10 @@ import queue
 
 class Scanner:
     DEFAULT_EXCLUDED_DIRS = {
-        'node_modules', 'venv', '.git', '.idea', '__pycache__', 
-        'bin', 'obj', 'target', '.vscode', 'build', 'dist', 
-        '.svn', '.hg', 'bower_components'
+        'node_modules', 'venv', 'env', '.venv', '.git', '.idea', '__pycache__',
+        'bin', 'obj', 'target', '.vscode', 'build', 'dist', '.vs', '.gradle',
+        '.svn', '.hg', 'bower_components', '.tox', '.pytest_cache', '.mypy_cache',
+        '.cache', 'logs', 'log'
     }
     
     DEFAULT_EXCLUDED_EXTENSIONS = {
@@ -167,7 +168,8 @@ class Scanner:
             return []
 
         if max_workers is None:
-            max_workers = min(24, max(4, (os.cpu_count() or 4) * 2))
+            # 使用适中的线程数，避免在机械硬盘或大目录下线程过多导致系统调度压力过大
+            max_workers = min(12, max(4, (os.cpu_count() or 4)))
 
         lock = threading.Lock()
         q: queue.Queue[str | None] = queue.Queue()

@@ -1,10 +1,10 @@
 import os
+from collections import deque
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import textwrap
 
 class PDFGenerator:
     def __init__(self, output_path, software_name, version):
@@ -87,22 +87,27 @@ class PDFGenerator:
         file_contents: list of (filename, content)
         check_cancel: function to check if cancelled
         """
-        # 1. Pre-process content into pages
-        pages = self._paginate(file_contents, check_cancel)
-        
-        if check_cancel and check_cancel():
+        total_pages = 0
+        first_pages: list[list[str]] = []
+        tail_pages: deque[list[str]] = deque(maxlen=30)
+
+        for page_lines in self._iter_pages(file_contents, check_cancel):
+            if check_cancel and check_cancel():
+                return 0, 0
+            total_pages += 1
+            if total_pages <= 60:
+                first_pages.append(page_lines)
+            else:
+                tail_pages.append(page_lines)
+
+        if total_pages == 0:
             return 0, 0
-        
-        # 2. Select pages (All or First 30 + Last 30)
-        selected_pages = []
-        total_pages = len(pages)
-        
+
         if total_pages <= 60:
-            selected_pages = pages
+            selected_pages = first_pages
         else:
-            selected_pages = pages[:30] + pages[-30:]
-            
-        # 3. Render PDF
+            selected_pages = first_pages[:30] + list(tail_pages)
+
         c = canvas.Canvas(self.output_path, pagesize=A4)
         c.setFont(self.font_name, self.font_size)
         
@@ -125,34 +130,28 @@ class PDFGenerator:
         c.save()
         return total_pages, len(selected_pages)
 
-    def _paginate(self, file_contents, check_cancel=None) -> list[list[str]]:
-        pages = []
+    def _iter_pages(self, file_contents, check_cancel=None):
         current_page_lines = []
         current_lines_count = 0
         
         for filename, content in file_contents:
             if check_cancel and check_cancel():
-                return []
+                return
                 
-            # Add file header line
             header_line = f"--- File: {filename} ---"
             wrapped_header = self._wrap_line(header_line)
             
             for line in wrapped_header:
                 if current_lines_count >= self.lines_per_page:
-                    pages.append(current_page_lines)
+                    yield current_page_lines
                     current_page_lines = []
                     current_lines_count = 0
                 current_page_lines.append(line)
                 current_lines_count += 1
             
-            # Process content lines
-            # Replace tabs
             content = content.replace('\t', '    ')
             lines = content.splitlines()
             
-            # Reduce multiple empty lines? 
-            # Requirement: "去除过多的空行（建议连续空行保留1行）"
             cleaned_lines = []
             last_empty = False
             for l in lines:
@@ -166,21 +165,17 @@ class PDFGenerator:
                     last_empty = False
             
             for line in cleaned_lines:
-                # Wrap line
                 wrapped = self._wrap_line(line)
                 for w_line in wrapped:
                     if current_lines_count >= self.lines_per_page:
-                        pages.append(current_page_lines)
+                        yield current_page_lines
                         current_page_lines = []
                         current_lines_count = 0
                     current_page_lines.append(w_line)
                     current_lines_count += 1
                     
-        # Add last page
         if current_page_lines:
-            pages.append(current_page_lines)
-            
-        return pages
+            yield current_page_lines
 
     def _wrap_line(self, line):
         if not line:

@@ -1126,6 +1126,8 @@ class MainApplication(tk.Tk):
                         self._set_progress(prog)
 
             file_contents = [r for r in results if r is not None]
+            results.clear()
+            del results
             
             read_duration = time.time() - read_start_time
             self._set_metric(self.metric_non_empty_files_var, str(non_empty_files))
