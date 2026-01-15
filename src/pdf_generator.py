@@ -6,6 +6,10 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# 字体注册单例，避免重复注册开销
+_FONT_REGISTERED = False
+_REGISTERED_FONT_NAME = 'Helvetica'
+
 class PDFGenerator:
     def __init__(self, output_path, software_name, version):
         self.output_path = output_path
@@ -44,6 +48,13 @@ class PDFGenerator:
         self._char_width_cache = {}
 
     def _register_font(self):
+        global _FONT_REGISTERED, _REGISTERED_FONT_NAME
+        
+        # 单例模式：如果已注册过，直接复用
+        if _FONT_REGISTERED:
+            self.font_name = _REGISTERED_FONT_NAME
+            return
+            
         try:
             # Try common Windows font paths with proper configuration
             # (FontName, FilePath, SubFontIndex for TTC)
@@ -60,14 +71,12 @@ class PDFGenerator:
                 if os.path.exists(path):
                     try:
                         if path.lower().endswith('.ttc'):
-                            # Register TTC font with specific index
-                            # subfontIndex=0 usually maps to the Regular version
                             font = TTFont(name, path, subfontIndex=index if index is not None else 0)
                         else:
                             font = TTFont(name, path)
                             
                         pdfmetrics.registerFont(font)
-                        self.font_name = name # Use the name we successfully registered
+                        self.font_name = name
                         print(f"Successfully registered font: {name} from {path}")
                         found = True
                         break
@@ -81,6 +90,10 @@ class PDFGenerator:
         except Exception as e:
             print(f"Error registering font: {e}")
             self.font_name = 'Helvetica'
+        
+        # 标记为已注册
+        _FONT_REGISTERED = True
+        _REGISTERED_FONT_NAME = self.font_name
 
     def generate(self, file_contents: list[tuple[str, str]], check_cancel=None):
         """
@@ -109,19 +122,20 @@ class PDFGenerator:
             selected_pages = first_pages[:30] + list(tail_pages)
 
         c = canvas.Canvas(self.output_path, pagesize=A4)
+        print(f"[PDF] Using font: {self.font_name}, software_name: {self.software_name}")
         c.setFont(self.font_name, self.font_size)
         
         for i, page_lines in enumerate(selected_pages):
             if check_cancel and check_cancel():
                 return 0, 0
             
-            # Ensure font is set for each page to avoid state loss after showPage
+            # 每页开始时先设置字体，确保中文正确显示
             c.setFont(self.font_name, self.font_size)
-                
+            
             page_num = i + 1
             self._draw_header(c, page_num)
             
-            # Re-set font for content just in case header modified it (though header uses saveState)
+            # header 使用 saveState/restoreState，这里恢复内容字体
             c.setFont(self.font_name, self.font_size)
             self._draw_content(c, page_lines)
             
@@ -180,6 +194,10 @@ class PDFGenerator:
     def _wrap_line(self, line):
         if not line:
             return [""]
+
+        # 快速路径：纯 ASCII 且长度在安全范围内，避免 stringWidth 调用
+        if line.isascii() and len(line) <= self.chars_per_line:
+            return [line]
 
         full_width = pdfmetrics.stringWidth(line, self.font_name, self.font_size)
         if full_width <= self.content_width:

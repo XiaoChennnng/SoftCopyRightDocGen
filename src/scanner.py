@@ -1,6 +1,10 @@
 import os
 import pathlib
-import chardet
+# 优先使用 cchardet (C 实现，速度快 10x+)，fallback 到 chardet
+try:
+    import cchardet as chardet
+except ImportError:
+    import chardet
 from typing import List, Optional
 
 import re
@@ -27,8 +31,16 @@ class Scanner:
         '.mp3', '.mp4', '.avi', '.mov', '.wav'
     }
 
-    @staticmethod
-    def remove_code_comments(content: str, ext: str) -> str:
+    # 预编译正则表达式，避免重复编译开销
+    _C_STYLE_COMMENT_RE = re.compile(
+        r'("(?:\\.|[^"\\])*"|' r"'(?:\\.|[^'\\])*')" r'|(/\*[\s\S]*?\*/|//.*)',
+        re.MULTILINE
+    )
+    _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+    _PYTHON_HASH_COMMENT_RE = re.compile(r'(?m)^ *#.*\n?')
+
+    @classmethod
+    def remove_code_comments(cls, content: str, ext: str) -> str:
         """
         Removes comments from code based on file extension.
         """
@@ -89,20 +101,16 @@ class Scanner:
         elif ext in ['.c', '.cpp', '.h', '.hpp', '.cc', '.cxx', '.m', '.mm', 
                      '.java', '.js', '.ts', '.jsx', '.tsx', '.cs', '.go', '.rs', '.swift', '.kt', '.scala',
                      '.php', '.css', '.scss', '.less']:
-            # Remove // and /* */
-            # Use improved regex to handle strings with escaped quotes correctly
-            pattern = r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|(/\*[\s\S]*?\*/|//.*)'
-            regex = re.compile(pattern, re.MULTILINE)
-            
+            # 使用预编译的正则表达式
             def replace(match):
                 if match.group(2) is not None:
                     return ""
                 return match.group(1)
-            return regex.sub(replace, content)
+            return cls._C_STYLE_COMMENT_RE.sub(replace, content)
             
-        # HTML/XML
+        # HTML/XML - 使用预编译的正则表达式
         elif ext in ['.html', '.htm', '.xml', '.svg', '.vue']:
-            return re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+            return cls._HTML_COMMENT_RE.sub("", content)
             
         # Lua, SQL, etc. can be added if needed
         
@@ -176,6 +184,22 @@ class Scanner:
         q.put(str(self.root_dir))
 
         cancel_flag = threading.Event()
+        
+        # 时间节流：避免多线程同时触发回调导致 GUI 卡顿
+        import time
+        last_callback_time = [0.0]  # 使用列表以便在闭包中修改
+        callback_lock = threading.Lock()
+        MIN_CALLBACK_INTERVAL = 0.1  # 最小回调间隔 100ms
+
+        def throttled_callback(count, path):
+            if not progress_callback:
+                return
+            now = time.time()
+            with callback_lock:
+                if now - last_callback_time[0] < MIN_CALLBACK_INTERVAL:
+                    return
+                last_callback_time[0] = now
+            progress_callback(count, path)
 
         def worker():
             nonlocal scanned_count
@@ -219,8 +243,9 @@ class Scanner:
                                     else:
                                         local_valid = None
 
-                                    if progress_callback and local_scanned % 200 == 0:
-                                        progress_callback(local_valid if local_valid is not None else len(valid_files), file_path)
+                                    # 使用节流回调，避免 UI 卡顿
+                                    if local_scanned % 500 == 0:
+                                        throttled_callback(local_valid if local_valid is not None else len(valid_files), file_path)
                     except (PermissionError, FileNotFoundError, NotADirectoryError):
                         pass
                 finally:
@@ -276,7 +301,9 @@ class Scanner:
             except UnicodeDecodeError:
                 pass
 
-            result = chardet.detect(raw_data)
+            # 仅采样前 32KB 进行编码检测，避免大文件全量扫描
+            sample = raw_data[:32768] if len(raw_data) > 32768 else raw_data
+            result = chardet.detect(sample)
             encoding = result.get('encoding') or 'utf-8'
 
             try:

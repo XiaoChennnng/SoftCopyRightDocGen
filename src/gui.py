@@ -461,7 +461,7 @@ class MainApplication(tk.Tk):
         self._last_output_path: str | None = None
 
         self._log_queue = queue.Queue()
-        self._log_flush_interval_ms = 80
+        self._log_flush_interval_ms = 150
         self._log_flush_job = None
 
         self._apply_theme()
@@ -1111,12 +1111,12 @@ class MainApplication(tk.Tk):
                             f.cancel()
                         raise Exception("任务已取消")
 
-                    idx, name, content, lines, ok = fut.result()
-                    last_name = name
+                    idx, file_name, content, lines, ok = fut.result()
+                    last_name = file_name
                     completed += 1
 
                     if ok:
-                        results[idx] = (name, content)
+                        results[idx] = (file_name, content)
                         total_lines += lines
                         non_empty_files += 1
 
